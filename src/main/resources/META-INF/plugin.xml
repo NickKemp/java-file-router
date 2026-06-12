@@ -1,0 +1,27 @@
+<idea-plugin>
+    <id>com.github.nickkemp.javafilerouter</id>
+    <name>Java File Download Router</name>
+    <vendor>Nick Kemp</vendor>
+    <description><![CDATA[
+        Routes downloaded Java files into the correct source package directory.
+        <br><br>
+        Select a module, then pick a .java or .zip file from your Downloads folder.
+        The plugin reads the package declaration and copies the file to the matching
+        source directory in the selected module.
+        <br><br>
+        If the file already exists it is renamed to .java.bak before the new version
+        is copied in. If the package does not exist in the project the file is not routed.
+        <br><br>
+        Useful when working with AI assistants that generate Java source files.
+    ]]></description>
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.java</depends>
+    <actions>
+        <action id="com.github.nickkemp.javafilerouter.RouteDownloadedFileAction"
+                class="com.github.nickkemp.javafilerouter.RouteDownloadedFileAction"
+                text="Route Downloaded Java File..."
+                description="Route a downloaded .java or .zip file to the correct source package">
+            <add-to-group group-id="BuildMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>

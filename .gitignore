@@ -1,0 +1,16 @@
+# Gradle
+.gradle/
+build/
+gradle.properties
+
+# IntelliJ Platform sandbox — generated at runtime, never commit
+.intellijPlatform/
+
+# IntelliJ project files
+.idea/
+*.iml
+out/
+
+# OS
+.DS_Store
+Thumbs.db

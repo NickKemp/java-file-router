@@ -1,0 +1,6 @@
+perm-Tmlja19LZW1w.OTItMTc5NTY=.Mxz5a7H5nDv8dWCVrR2MTVUqYos7E4
+
+gradlew publishPlugin -Ppublish.token=perm-Tmlja19LZW1w.OTItMTc5NTY=.Mxz5a7H5nDv8dWCVrR2MTVUqYos7E4
+
+git add .
+git push
