@@ -172,7 +172,9 @@ class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(pr
         object : DialogWrapperAction("Route") {
             override fun doAction(e: ActionEvent) { routeFiles() }
         },
-        cancelAction
+        object : DialogWrapperAction("Close") {
+            override fun doAction(e: ActionEvent) { close(OK_EXIT_CODE) }
+        }
     )
 
     // ── Load and filter ───────────────────────────────────────────────────

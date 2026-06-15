@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.0.2 - 2026-06-13
+
+### Changed
+
+- Cancel button renamed to Close
+
 ## 1.0.1 - 2026-06-12
 
 ### Fixed
