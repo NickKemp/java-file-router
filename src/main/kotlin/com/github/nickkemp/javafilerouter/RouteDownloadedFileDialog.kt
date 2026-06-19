@@ -9,6 +9,7 @@ import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBScrollPane
 import java.awt.BorderLayout
+import java.awt.Color
 import java.awt.Dimension
 import java.awt.event.ActionEvent
 import java.io.File
@@ -22,26 +23,43 @@ import javax.swing.text.MaskFormatter
 
 class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(project) {
 
+    // ── Font ──────────────────────────────────────────────────────────────
+
     private val editorFont = EditorColorsManager.getInstance().globalScheme.let {
         java.awt.Font(it.editorFontName, java.awt.Font.PLAIN, it.editorFontSize)
     }
 
+    // ── File status ───────────────────────────────────────────────────────
+
+    enum class FileStatus { NEW, CHANGED, IDENTICAL, SKIP }
+
+    data class AnalysedEntry(val label: String, val status: FileStatus)
+
+    // ── UI components ─────────────────────────────────────────────────────
+
     private val moduleCombo   = ComboBox<String>()
     private val fileListModel = DefaultListModel<DownloadedFile>()
     private val fileList      = JList<DownloadedFile>(fileListModel)
-    private val previewArea   = JTextArea(7, 60).apply {
+    private val statusArea    = JTextArea(10, 60).apply {
         isEditable = false
         font = editorFont
     }
-    private val resultArea    = JTextArea(7, 60).apply {
+    private val resultArea    = JTextArea(5, 60).apply {
         isEditable = false
         font = editorFont
     }
 
-    private val sdf           = SimpleDateFormat("dd/MM/yyyy")
-    private val sdtf          = SimpleDateFormat("dd/MM/yyyy HH:mm")
-    private val downloadsDir  = File(System.getProperty("user.home") + File.separator + "Downloads")
-    private val checkedItems  = mutableSetOf<Int>()
+    private val sdf          = SimpleDateFormat("dd/MM/yyyy")
+    private val sdtf         = SimpleDateFormat("dd/MM/yyyy HH:mm")
+    private val downloadsDir = File(System.getProperty("user.home") + File.separator + "Downloads")
+    private val checkedItems = mutableSetOf<Int>()
+
+    // Analyse results: keyed by "zipname/filename" or "filename"
+    private val analysedEntries = mutableListOf<AnalysedEntry>()
+    private var analyseComplete = false
+
+    private lateinit var analyseAction: Action
+    private lateinit var installAction: Action
 
     // ── DownloadedFile model ──────────────────────────────────────────────
 
@@ -53,22 +71,22 @@ class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(pr
 
     private val fromField = createDateField()
     private val toField   = createDateField()
+    private val allFiles  = mutableListOf<DownloadedFile>()
 
     private fun createDateField(): JFormattedTextField {
         val fmt = MaskFormatter("##/##/####").apply { placeholderCharacter = '_' }
         return JFormattedTextField(fmt).apply {
-            columns    = 10
-            text       = sdf.format(Date())
-            addPropertyChangeListener("value") { applyFilter() }
+            columns = 10
+            text    = sdf.format(Date())
+            addPropertyChangeListener("value") { resetAnalysis() }
         }
     }
 
-    private val allFiles = mutableListOf<DownloadedFile>()
     init {
         title = "Route Downloaded Java File"
         loadDownloadsFolder()
-        init()        // triggers createCenterPanel() — UI is ready after this
-        applyFilter() // now safe to populate the list
+        init()
+        applyFilter()
     }
 
     override fun createCenterPanel(): JComponent {
@@ -81,7 +99,7 @@ class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(pr
             .map { it.name }.sorted()
             .forEach { moduleCombo.addItem(it) }
         moduleCombo.preferredSize = Dimension(300, 28)
-        moduleCombo.addActionListener { updatePreview() }
+        moduleCombo.addActionListener { resetAnalysis() }
         modulePanel.add(moduleCombo)
 
         // ── Date filter ───────────────────────────────────────────────────
@@ -118,12 +136,12 @@ class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(pr
         fileList.addMouseListener(object : java.awt.event.MouseAdapter() {
             override fun mouseClicked(e: java.awt.event.MouseEvent) {
                 val index = fileList.locationToIndex(e.point)
-                if (index >= 0) { toggleChecked(index); updatePreview() }
+                if (index >= 0) { toggleChecked(index); resetAnalysis() }
             }
         })
 
-        val selectAllBtn = JButton("Select All").apply  { addActionListener { setAllChecked(true);  updatePreview() } }
-        val clearAllBtn  = JButton("Clear All").apply   { addActionListener { setAllChecked(false); updatePreview() } }
+        val selectAllBtn = JButton("Select All").apply  { addActionListener { setAllChecked(true);  resetAnalysis() } }
+        val clearAllBtn  = JButton("Clear All").apply   { addActionListener { setAllChecked(false); resetAnalysis() } }
         val refreshBtn   = JButton("Refresh").apply     { addActionListener { loadDownloadsFolder(); applyFilter() } }
 
         val listBtnRow = JPanel().apply {
@@ -139,46 +157,54 @@ class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(pr
 
         val filePanel = JPanel(BorderLayout(4, 4))
         filePanel.add(filterPanel, BorderLayout.NORTH)
-        filePanel.add(JBScrollPane(fileList).apply { preferredSize = Dimension(620, 130) }, BorderLayout.CENTER)
+        filePanel.add(JBScrollPane(fileList).apply { preferredSize = Dimension(660, 130) }, BorderLayout.CENTER)
         filePanel.add(listBtnRow, BorderLayout.SOUTH)
 
-        // ── Preview ───────────────────────────────────────────────────────
-        val previewPanel = JPanel(BorderLayout(4, 4))
-        previewPanel.add(JBLabel("Preview:"), BorderLayout.NORTH)
-        previewPanel.add(JBScrollPane(previewArea).apply { preferredSize = Dimension(620, 110) }, BorderLayout.CENTER)
+        // ── Status ────────────────────────────────────────────────────────
+        val statusPanel = JPanel(BorderLayout(4, 4))
+        statusPanel.add(JBLabel("Analysis:"), BorderLayout.NORTH)
+        statusPanel.add(JBScrollPane(statusArea).apply { preferredSize = Dimension(660, 160) }, BorderLayout.CENTER)
 
         // ── Result ────────────────────────────────────────────────────────
         val resultPanel = JPanel(BorderLayout(4, 4))
         resultPanel.add(JBLabel("Result:"), BorderLayout.NORTH)
-        resultPanel.add(JBScrollPane(resultArea).apply { preferredSize = Dimension(620, 110) }, BorderLayout.CENTER)
+        resultPanel.add(JBScrollPane(resultArea).apply { preferredSize = Dimension(660, 90) }, BorderLayout.CENTER)
 
         // ── Centre layout ─────────────────────────────────────────────────
         val centre = JPanel().apply {
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
             add(filePanel)
             add(Box.createVerticalStrut(8))
-            add(previewPanel)
+            add(statusPanel)
             add(Box.createVerticalStrut(8))
             add(resultPanel)
         }
 
         panel.add(modulePanel, BorderLayout.NORTH)
         panel.add(centre,      BorderLayout.CENTER)
-        panel.preferredSize = Dimension(680, 620)
+        panel.preferredSize = Dimension(720, 680)
         return panel
     }
 
-    override fun createActions(): Array<Action> = arrayOf(
-        object : DialogWrapperAction("Route") {
-            override fun doAction(e: ActionEvent) { routeFiles() }
-        },
-        object : DialogWrapperAction("Close") {
-            override fun doAction(e: ActionEvent) { close(OK_EXIT_CODE) }
+    override fun createActions(): Array<Action> {
+        analyseAction = object : DialogWrapperAction("Analyse") {
+            override fun doAction(e: ActionEvent) { analyseFiles() }
         }
-    )
+        installAction = object : DialogWrapperAction("Install") {
+            override fun doAction(e: ActionEvent) { installFiles() }
+        }
+        installAction.isEnabled = false
+
+        return arrayOf(
+            analyseAction,
+            installAction,
+            object : DialogWrapperAction("Close") {
+                override fun doAction(e: ActionEvent) { close(OK_EXIT_CODE) }
+            }
+        )
+    }
 
     // ── Load and filter ───────────────────────────────────────────────────
-
 
     private fun loadDownloadsFolder() {
         allFiles.clear()
@@ -188,17 +214,17 @@ class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(pr
             f.isFile && (f.name.endsWith(".java") || f.name.endsWith(".zip"))
         }
         ?.map { DownloadedFile(it, it.lastModified()) }
-        ?.sortedByDescending { it.lastModified }  // newest first
+        ?.sortedByDescending { it.lastModified }
         ?.let { allFiles.addAll(it) }
     }
 
     private fun applyFilter() {
         fileListModel.clear()
         checkedItems.clear()
+        resetAnalysis()
 
         val fromDate = parseDate(fromField.text)
         val toDate   = parseDate(toField.text)?.let {
-            // Include the entire 'to' day
             Calendar.getInstance().apply { time = it; add(Calendar.DAY_OF_MONTH, 1) }.time
         }
 
@@ -207,8 +233,6 @@ class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(pr
             (fromDate == null || !fileDate.before(fromDate)) &&
             (toDate   == null || fileDate.before(toDate))
         }.forEach { fileListModel.addElement(it) }
-
-        updatePreview()
     }
 
     private fun parseDate(text: String): Date? {
@@ -227,105 +251,168 @@ class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(pr
         fileList.repaint()
     }
 
-    // ── Preview ───────────────────────────────────────────────────────────
+    // ── Reset analysis state ──────────────────────────────────────────────
 
-    private fun updatePreview() {
-        previewArea.text = ""
-        val sourceRoots = getSourceRoots() ?: return
+    private fun resetAnalysis() {
+        analyseComplete = false
+        analysedEntries.clear()
+        statusArea.text = ""
+        resultArea.text = ""
+        installAction.isEnabled = false
+        fileList.repaint()
+    }
+
+    // ── Analyse ───────────────────────────────────────────────────────────
+
+    private fun analyseFiles() {
+        resetAnalysis()
+        val sourceRoots = getSourceRoots() ?: run { status("ERROR: No source roots found for selected module."); return }
+
+        if (checkedItems.isEmpty()) { status("No files selected."); return }
+
+        var newCount       = 0
+        var changedCount   = 0
+        var identicalCount = 0
+        var skipCount      = 0
 
         checkedItems.sorted().forEach { index ->
             val df = fileListModel.getElementAt(index)
             when {
-                df.file.name.endsWith(".zip")  -> previewZip(df.file, sourceRoots)
-                df.file.name.endsWith(".java") -> previewJava(df.file, sourceRoots)
+                df.file.name.endsWith(".zip")  -> {
+                    val counts = analyseZip(df.file, sourceRoots)
+                    newCount       += counts[0]
+                    changedCount   += counts[1]
+                    identicalCount += counts[2]
+                    skipCount      += counts[3]
+                }
+                df.file.name.endsWith(".java") -> {
+                    when (analyseJava(df.file, sourceRoots)) {
+                        FileStatus.NEW       -> newCount++
+                        FileStatus.CHANGED   -> changedCount++
+                        FileStatus.IDENTICAL -> identicalCount++
+                        FileStatus.SKIP      -> skipCount++
+                    }
+                }
             }
         }
 
-        if (previewArea.text.isEmpty() && checkedItems.isNotEmpty())
-            previewArea.text = "No files can be routed — check module and package."
+        status("")
+        status("── Summary ─────────────────────────────────────────")
+        status("  NEW:       $newCount  file(s) — will be installed")
+        status("  CHANGED:   $changedCount  file(s) — will be installed")
+        status("  IDENTICAL: $identicalCount  file(s) — will be skipped")
+        status("  SKIPPED:   $skipCount  file(s) — package not found or no package")
+
+        analyseComplete = true
+        installAction.isEnabled = (newCount + changedCount) > 0
+        if (!installAction.isEnabled) status("\nNothing to install.")
     }
 
-    private fun previewJava(file: File, sourceRoots: List<File>) {
-        val pkg       = readPackage(file.readText()) ?: run { preview("SKIP (no package):  ${file.name}"); return }
-        val targetDir = findPackageDir(pkg, sourceRoots) ?: run { preview("SKIP (pkg missing): $pkg  ←  ${file.name}"); return }
+    private fun analyseJava(file: File, sourceRoots: List<File>): FileStatus {
+        val content   = file.readText()
+        val pkg       = readPackage(content) ?: run { status("SKIP  (no package):  ${file.name}"); return FileStatus.SKIP }
+        val targetDir = findPackageDir(pkg, sourceRoots) ?: run { status("SKIP  (pkg missing): $pkg  ←  ${file.name}"); return FileStatus.SKIP }
         val className = cleanFileName(file.name)
-        if (File(targetDir, className).exists()) preview("BACKUP → $className.bak")
-        preview("ROUTE  ${file.name}  →  ${targetDir.absolutePath}")
+        val target    = File(targetDir, className)
+        return when {
+            !target.exists()               -> { status("NEW       ${file.name}"); FileStatus.NEW }
+            target.readText() == content   -> { FileStatus.IDENTICAL }
+            else                           -> { status("CHANGED   ${file.name}"); FileStatus.CHANGED }
+        }
     }
 
-    private fun previewZip(file: File, sourceRoots: List<File>) {
-        preview("ZIP: ${file.name}")
-        var count = 0
+    private fun analyseZip(file: File, sourceRoots: List<File>): IntArray {
+        var newCount = 0; var changedCount = 0; var identicalCount = 0; var skipCount = 0
+        status("ZIP: ${file.name}")
+        var javaCount = 0
         ZipFile(file).use { zip ->
             zip.entries().asSequence().filter { !it.isDirectory && it.name.endsWith(".java") }.forEach { entry ->
-                count++
+                javaCount++
                 val content   = zip.getInputStream(entry).bufferedReader().readText()
                 val pkg       = readPackage(content)
                 val fileName  = entry.name.substringAfterLast("/")
                 val className = cleanFileName(fileName)
                 if (pkg == null) {
-                    preview("  SKIP (no package):  $fileName")
+                    status("  SKIP  (no package):  $fileName")
+                    skipCount++
                     return@forEach
                 }
                 val targetDir = findPackageDir(pkg, sourceRoots)
                 if (targetDir == null) {
-                    preview("  SKIP (pkg missing): $pkg")
-                    preview("         $fileName")
+                    status("  SKIP  (pkg missing): $pkg  ←  $fileName")
+                    skipCount++
                     return@forEach
                 }
-                if (File(targetDir, className).exists())
-                    preview("  BACKUP $className  →  $className.bak")
-                preview("  ROUTE  $fileName")
-                preview("         →  ${targetDir.absolutePath}")
+                val target = File(targetDir, className)
+                when {
+                    !target.exists()                   -> { status("  NEW       $fileName"); newCount++ }
+                    target.readText() == content       -> { identicalCount++ }
+                    else                               -> { status("  CHANGED   $fileName"); changedCount++ }
+                }
             }
         }
-        if (count == 0) {
-            val otherTypes = ZipFile(file).use { zip ->
-                zip.entries().asSequence()
-                    .filter { !it.isDirectory }
-                    .map { it.name.substringAfterLast(".").lowercase() }
-                    .distinct().sorted().toList()
-            }
-            if (otherTypes.isEmpty())
-                preview("  (zip is empty)")
-            else
-                preview("  (no routeable .java files — zip contains: ${otherTypes.joinToString(", ")})")
-        }
+        if (javaCount == 0) status("  (no routeable .java files in zip)")
+        return intArrayOf(newCount, changedCount, identicalCount, skipCount)
     }
 
-    // ── Route ─────────────────────────────────────────────────────────────
+    // ── Install ───────────────────────────────────────────────────────────
 
-    private fun routeFiles() {
+    private fun installFiles() {
         resultArea.text = ""
+        if (!analyseComplete) { result("Run Analyse first."); return }
         val sourceRoots = getSourceRoots() ?: return
-        var routed = 0; var errors = 0
+        var installed = 0; var skipped = 0; var errors = 0
 
         checkedItems.sorted().forEach { index ->
             val df = fileListModel.getElementAt(index)
             when {
-                df.file.name.endsWith(".zip")  -> { val (r, e) = routeZip(df.file, sourceRoots);  routed += r; errors += e }
-                df.file.name.endsWith(".java") -> { if (routeJava(df.file, sourceRoots)) routed++ else errors++ }
+                df.file.name.endsWith(".zip")  -> {
+                    val (i, s, e) = installZip(df.file, sourceRoots)
+                    installed += i; skipped += s; errors += e
+                }
+                df.file.name.endsWith(".java") -> {
+                    when (installJava(df.file, sourceRoots)) {
+                        InstallResult.INSTALLED -> installed++
+                        InstallResult.SKIPPED   -> skipped++
+                        InstallResult.ERROR     -> errors++
+                    }
+                }
             }
         }
 
         result("")
-        result("Complete: $routed file(s) routed, $errors skipped.")
+        result("── Complete ─────────────────────────────────────────")
+        result("  Installed: $installed  |  Skipped (identical): $skipped  |  Errors: $errors")
         LocalFileSystem.getInstance().refresh(true)
     }
 
-    private fun routeJava(file: File, sourceRoots: List<File>): Boolean {
-        val pkg       = readPackage(file.readText()) ?: run { result("SKIP (no package):  ${file.name}"); return false }
-        val targetDir = findPackageDir(pkg, sourceRoots) ?: run { result("SKIP (pkg missing): $pkg  ←  ${file.name}"); return false }
+    enum class InstallResult { INSTALLED, SKIPPED, ERROR }
+
+    private fun installJava(file: File, sourceRoots: List<File>): InstallResult {
+        val content   = file.readText()
+        val pkg       = readPackage(content) ?: run { result("SKIP  (no package):  ${file.name}"); return InstallResult.ERROR }
+        val targetDir = findPackageDir(pkg, sourceRoots) ?: run { result("SKIP  (pkg missing): $pkg  ←  ${file.name}"); return InstallResult.ERROR }
         val className = cleanFileName(file.name)
         val target    = File(targetDir, className)
-        if (target.exists()) { val bak = File(targetDir, "$className.bak"); if (bak.exists()) bak.delete(); target.renameTo(bak); result("Backed up: $className  →  $className.bak") }
+
+        if (target.exists() && target.readText() == content) {
+            return InstallResult.SKIPPED
+        }
+
+        if (target.exists()) {
+            val bak = File(targetDir, "$className.bak")
+            if (bak.exists()) bak.delete()
+            target.renameTo(bak)
+            result("BACKUP    $className  →  $className.bak")
+        }
+
         Files.copy(file.toPath(), target.toPath())
-        result("Routed:   ${file.name}  →  ${targetDir.absolutePath}")
-        return true
+        result("INSTALLED ${file.name}  →  ${targetDir.absolutePath}")
+        return InstallResult.INSTALLED
     }
 
-    private fun routeZip(file: File, sourceRoots: List<File>): Pair<Int, Int> {
-        var routed = 0; var errors = 0
+    private fun installZip(file: File, sourceRoots: List<File>): Triple<Int, Int, Int> {
+        var installed = 0; var skipped = 0; var errors = 0
         result("ZIP: ${file.name}")
         ZipFile(file).use { zip ->
             zip.entries().asSequence().filter { !it.isDirectory && it.name.endsWith(".java") }.forEach { entry ->
@@ -333,16 +420,31 @@ class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(pr
                 val pkg       = readPackage(content)
                 val fileName  = entry.name.substringAfterLast("/")
                 val className = cleanFileName(fileName)
-                if (pkg == null) { result("  SKIP (no package):  $fileName"); errors++; return@forEach }
-                val targetDir = findPackageDir(pkg, sourceRoots) ?: run { result("  SKIP (pkg missing): $pkg  ←  $fileName"); errors++; return@forEach }
-                val target    = File(targetDir, className)
-                if (target.exists()) { val bak = File(targetDir, "$className.bak"); if (bak.exists()) bak.delete(); target.renameTo(bak); result("  Backed up: $className  →  $className.bak") }
+
+                if (pkg == null) { result("  SKIP  (no package):  $fileName"); errors++; return@forEach }
+                val targetDir = findPackageDir(pkg, sourceRoots) ?: run {
+                    result("  SKIP  (pkg missing): $pkg  ←  $fileName"); errors++; return@forEach
+                }
+                val target = File(targetDir, className)
+
+                if (target.exists() && target.readText() == content) {
+                    skipped++
+                    return@forEach
+                }
+
+                if (target.exists()) {
+                    val bak = File(targetDir, "$className.bak")
+                    if (bak.exists()) bak.delete()
+                    target.renameTo(bak)
+                    result("  BACKUP    $className  →  $className.bak")
+                }
+
                 target.writeText(content)
-                result("  Routed:   $fileName  →  ${targetDir.absolutePath}")
-                routed++
+                result("  INSTALLED $fileName  →  ${targetDir.absolutePath}")
+                installed++
             }
         }
-        return Pair(routed, errors)
+        return Triple(installed, skipped, errors)
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────
@@ -369,8 +471,8 @@ class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(pr
     }
 
     private fun cleanFileName(name: String) = name.replace(Regex("\\s*\\(\\d+\\)\\.java$"), ".java")
-    private fun preview(line: String) { previewArea.append(line + "\n") }
-    private fun result(line: String)  { resultArea.append(line + "\n")  }
+    private fun status(line: String) { statusArea.append(line + "\n") }
+    private fun result(line: String) { resultArea.append(line + "\n") }
 
     // ── Checkbox list renderer ────────────────────────────────────────────
 
@@ -378,7 +480,7 @@ class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(pr
         private val panel     = JPanel(BorderLayout())
         private val checkBox  = JCheckBox().apply { font = editorFont }
         private val dateLabel = JBLabel("").apply {
-            foreground = java.awt.Color.GRAY
+            foreground = Color.GRAY
             font = editorFont
         }
         init { panel.add(checkBox, BorderLayout.WEST); panel.add(dateLabel, BorderLayout.EAST) }
@@ -386,14 +488,14 @@ class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(pr
         override fun getListCellRendererComponent(
             list: JList<out DownloadedFile>, value: DownloadedFile, index: Int,
             isSelected: Boolean, cellHasFocus: Boolean): java.awt.Component {
-            checkBox.text      = value.file.name
+            checkBox.text       = value.file.name
             checkBox.isSelected = checkedItems.contains(index)
-            dateLabel.text     = "  " + sdtf.format(Date(value.lastModified)) + "  "
+            dateLabel.text      = "  " + sdtf.format(Date(value.lastModified)) + "  "
             val bg = if (isSelected) list.selectionBackground else list.background
-            panel.background    = bg
-            checkBox.background = bg
+            panel.background     = bg
+            checkBox.background  = bg
             dateLabel.background = bg
-            checkBox.foreground = if (isSelected) list.selectionForeground else list.foreground
+            checkBox.foreground  = if (isSelected) list.selectionForeground else list.foreground
             return panel
         }
     }
