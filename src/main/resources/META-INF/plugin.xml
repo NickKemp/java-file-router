@@ -9,8 +9,14 @@
         The plugin reads the package declaration and copies the file to the matching
         source directory in the selected module.
         <br><br>
+        The module selector automatically pre-selects the module containing the
+        currently open file in the editor.
+        <br><br>
+        After Analyse, use Show Diffs to review any changed files in IntelliJ's
+        built-in diff viewer before installing.
+        <br><br>
         If the file already exists it is renamed to .java.bak before the new version
-        is copied in. If the package does not exist in the project the file is not routed.
+        is copied in. If the package does not exist in the project it is created automatically.
         <br><br>
         Useful when working with AI assistants that generate Java source files.
     ]]></description>

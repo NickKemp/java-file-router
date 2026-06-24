@@ -1,0 +1,9 @@
+perm-Tmlja19LZW1w.OTItMTc5NTY=.Mxz5a7H5nDv8dWCVrR2MTVUqYos7E4
+
+gradlew publishPlugin -Ppublish.token=perm-Tmlja19LZW1w.OTItMTc5NTY=.Mxz5a7H5nDv8dWCVrR2MTVUqYos7E4
+
+git add .
+git commit -m "Release 1.4.0"
+git tag 1.4.0
+git push origin master
+git push origin 1.4.0

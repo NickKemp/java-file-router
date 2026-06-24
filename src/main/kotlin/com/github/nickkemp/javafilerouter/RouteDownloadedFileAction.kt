@@ -2,7 +2,6 @@ package com.github.nickkemp.javafilerouter
 
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
-import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 
 class RouteDownloadedFileAction : AnAction() {
@@ -12,7 +11,7 @@ class RouteDownloadedFileAction : AnAction() {
             Messages.showErrorDialog("No project open.", "Java File Router")
             return
         }
-        RouteDownloadedFileDialog(project).show()
+        RouteDownloadedFileDialog(project, e).show()
     }
 
     override fun update(e: AnActionEvent) {

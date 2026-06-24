@@ -1,6 +1,13 @@
 package com.github.nickkemp.javafilerouter
 
+import com.intellij.diff.DiffContentFactory
+import com.intellij.diff.DiffManager
+import com.intellij.diff.contents.DiffContent
+import com.intellij.diff.requests.SimpleDiffRequest
+import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.actionSystem.CommonDataKeys
 import com.intellij.openapi.module.ModuleManager
+import com.intellij.openapi.module.ModuleUtilCore
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.roots.ModuleRootManager
 import com.intellij.openapi.ui.ComboBox
@@ -21,7 +28,10 @@ import javax.swing.*
 import com.intellij.openapi.editor.colors.EditorColorsManager
 import javax.swing.text.MaskFormatter
 
-class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(project) {
+class RouteDownloadedFileDialog(
+    private val project: Project,
+    private val event: AnActionEvent
+) : DialogWrapper(project) {
 
     // ── Font ──────────────────────────────────────────────────────────────
 
@@ -31,9 +41,22 @@ class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(pr
 
     // ── File status ───────────────────────────────────────────────────────
 
-    enum class FileStatus { NEW, CHANGED, IDENTICAL, SKIP }
+    enum class FileStatus { NEW, CHANGED, IDENTICAL, SKIP, NEW_PKG }
 
-    data class AnalysedEntry(val label: String, val status: FileStatus)
+    data class AnalysedEntry(
+        val pkg:      String?,   // null = no package declaration
+        val fileName: String,
+        val status:   FileStatus,
+        val source:   String     // originating file (zip name or java filename)
+    )
+
+    // ── Changed file record — holds both sides of the diff ────────────────
+
+    data class ChangedFile(
+        val fileName:        String,
+        val downloadedText:  String,
+        val existingText:    String
+    )
 
     // ── UI components ─────────────────────────────────────────────────────
 
@@ -54,12 +77,17 @@ class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(pr
     private val downloadsDir = File(System.getProperty("user.home") + File.separator + "Downloads")
     private val checkedItems = mutableSetOf<Int>()
 
-    // Analyse results: keyed by "zipname/filename" or "filename"
-    private val analysedEntries = mutableListOf<AnalysedEntry>()
-    private var analyseComplete = false
+    // Analyse results
+    private val analysedEntries  = mutableListOf<AnalysedEntry>()
+    private val changedFiles     = mutableListOf<ChangedFile>()
+    private val newPackages      = mutableSetOf<String>()  // distinct new package names
+    private var analyseComplete  = false
+    private var knownFileCount   = 0
+    private var newPackageCount  = 0
 
-    private lateinit var analyseAction: Action
-    private lateinit var installAction: Action
+    private lateinit var analyseAction:   Action
+    private lateinit var installAction:   Action
+    private lateinit var showDiffsAction: Action
 
     // ── DownloadedFile model ──────────────────────────────────────────────
 
@@ -95,9 +123,21 @@ class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(pr
         // ── Module selector ───────────────────────────────────────────────
         val modulePanel = JPanel().apply { layout = BoxLayout(this, BoxLayout.X_AXIS) }
         modulePanel.add(JBLabel("Module:  "))
+
         ModuleManager.getInstance(project).modules
             .map { it.name }.sorted()
             .forEach { moduleCombo.addItem(it) }
+
+        // Pre-select the module containing the currently active file
+        val virtualFile = event.getData(CommonDataKeys.VIRTUAL_FILE)
+            ?: event.getData(CommonDataKeys.PSI_FILE)?.virtualFile
+        if (virtualFile != null) {
+            val currentModule = ModuleUtilCore.findModuleForFile(virtualFile, project)
+            if (currentModule != null) {
+                moduleCombo.selectedItem = currentModule.name
+            }
+        }
+
         moduleCombo.preferredSize = Dimension(300, 28)
         moduleCombo.addActionListener { resetAnalysis() }
         modulePanel.add(moduleCombo)
@@ -186,6 +226,18 @@ class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(pr
         return panel
     }
 
+    override fun createSouthAdditionalPanel(): JPanel {
+        val version = com.intellij.ide.plugins.PluginManagerCore
+            .getPlugin(com.intellij.openapi.extensions.PluginId.getId(
+                "com.github.nickkemp.javafilerouter"))
+            ?.version ?: "unknown"
+        val label = JBLabel("Java File Download Router  v$version").apply {
+            foreground = java.awt.Color.GRAY
+            font       = editorFont.deriveFont(java.awt.Font.PLAIN, editorFont.size - 1f)
+        }
+        return JPanel(BorderLayout()).apply { add(label, BorderLayout.WEST) }
+    }
+
     override fun createActions(): Array<Action> {
         analyseAction = object : DialogWrapperAction("Analyse") {
             override fun doAction(e: ActionEvent) { analyseFiles() }
@@ -193,15 +245,91 @@ class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(pr
         installAction = object : DialogWrapperAction("Install") {
             override fun doAction(e: ActionEvent) { installFiles() }
         }
-        installAction.isEnabled = false
+        showDiffsAction = object : DialogWrapperAction("Show Diffs") {
+            override fun doAction(e: ActionEvent) { showDiffPicker() }
+        }
+        installAction.isEnabled   = false
+        showDiffsAction.isEnabled = false
 
         return arrayOf(
             analyseAction,
+            showDiffsAction,
             installAction,
             object : DialogWrapperAction("Close") {
                 override fun doAction(e: ActionEvent) { close(OK_EXIT_CODE) }
             }
         )
+    }
+
+    // ── Diff picker ───────────────────────────────────────────────────────
+
+    private fun showDiffPicker() {
+        if (changedFiles.isEmpty()) return
+
+        val dialog = object : DialogWrapper(project, true) {
+            init {
+                title = "Changed Files — Select to View Diff"
+                init()
+            }
+
+            override fun createCenterPanel(): JComponent {
+                val listModel = DefaultListModel<String>()
+                changedFiles.forEach { listModel.addElement(it.fileName) }
+
+                val list = JList(listModel).apply {
+                    selectionMode = ListSelectionModel.SINGLE_SELECTION
+                    font = editorFont
+                    selectedIndex = 0
+                }
+
+                val panel = JPanel(BorderLayout(4, 4))
+                panel.add(JBLabel("Select a file to view its diff:"), BorderLayout.NORTH)
+                panel.add(JBScrollPane(list).apply {
+                    preferredSize = Dimension(500, 300)
+                }, BorderLayout.CENTER)
+
+                // Double-click opens the diff immediately
+                list.addMouseListener(object : java.awt.event.MouseAdapter() {
+                    override fun mouseClicked(e: java.awt.event.MouseEvent) {
+                        if (e.clickCount == 2) {
+                            val index = list.selectedIndex
+                            if (index >= 0) openDiff(changedFiles[index])
+                        }
+                    }
+                })
+
+                val viewBtn = JButton("View Diff").apply {
+                    addActionListener {
+                        val index = list.selectedIndex
+                        if (index >= 0) openDiff(changedFiles[index])
+                    }
+                }
+
+                panel.add(viewBtn, BorderLayout.SOUTH)
+                return panel
+            }
+
+            override fun createActions(): Array<Action> = arrayOf(
+                object : DialogWrapperAction("Close") {
+                    override fun doAction(e: ActionEvent) { close(OK_EXIT_CODE) }
+                }
+            )
+        }
+        dialog.show()
+    }
+
+    private fun openDiff(changed: ChangedFile) {
+        val factory = DiffContentFactory.getInstance()
+        val left:  DiffContent = factory.create(changed.existingText)
+        val right: DiffContent = factory.create(changed.downloadedText)
+        val request = SimpleDiffRequest(
+            changed.fileName,
+            left,
+            right,
+            "Current (project)",
+            "Downloaded"
+        )
+        DiffManager.getInstance().showDiff(project, request)
     }
 
     // ── Load and filter ───────────────────────────────────────────────────
@@ -254,11 +382,16 @@ class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(pr
     // ── Reset analysis state ──────────────────────────────────────────────
 
     private fun resetAnalysis() {
-        analyseComplete = false
+        analyseComplete  = false
+        knownFileCount   = 0
+        newPackageCount  = 0
         analysedEntries.clear()
+        changedFiles.clear()
+        newPackages.clear()
         statusArea.text = ""
         resultArea.text = ""
-        installAction.isEnabled = false
+        installAction.isEnabled   = false
+        showDiffsAction.isEnabled = false
         fileList.repaint()
     }
 
@@ -267,92 +400,187 @@ class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(pr
     private fun analyseFiles() {
         resetAnalysis()
         val sourceRoots = getSourceRoots() ?: run { status("ERROR: No source roots found for selected module."); return }
-
         if (checkedItems.isEmpty()) { status("No files selected."); return }
 
+        // ── Pass 1: collect all entries ───────────────────────────────────
+        checkedItems.sorted().forEach { index ->
+            val df = fileListModel.getElementAt(index)
+            when {
+                df.file.name.endsWith(".zip")  -> collectZip(df.file, sourceRoots)
+                df.file.name.endsWith(".java") -> collectJava(df.file, sourceRoots)
+            }
+        }
+
+        // ── Pass 2: derive counts ─────────────────────────────────────────
         var newCount       = 0
         var changedCount   = 0
         var identicalCount = 0
         var skipCount      = 0
+        var newPkgCount    = 0
 
-        checkedItems.sorted().forEach { index ->
-            val df = fileListModel.getElementAt(index)
-            when {
-                df.file.name.endsWith(".zip")  -> {
-                    val counts = analyseZip(df.file, sourceRoots)
-                    newCount       += counts[0]
-                    changedCount   += counts[1]
-                    identicalCount += counts[2]
-                    skipCount      += counts[3]
-                }
-                df.file.name.endsWith(".java") -> {
-                    when (analyseJava(df.file, sourceRoots)) {
-                        FileStatus.NEW       -> newCount++
-                        FileStatus.CHANGED   -> changedCount++
-                        FileStatus.IDENTICAL -> identicalCount++
-                        FileStatus.SKIP      -> skipCount++
-                    }
-                }
+        analysedEntries.forEach { e ->
+            when (e.status) {
+                FileStatus.NEW       -> newCount++
+                FileStatus.CHANGED   -> changedCount++
+                FileStatus.IDENTICAL -> identicalCount++
+                FileStatus.SKIP      -> skipCount++
+                FileStatus.NEW_PKG   -> newPkgCount++
             }
         }
+
+        knownFileCount  = newCount + changedCount
+        newPackageCount = newPkgCount
+
+        // ── Pass 3: render grouped output ─────────────────────────────────
+
+        val byPkg   = linkedMapOf<String, MutableList<AnalysedEntry>>()
+        val skipped = mutableListOf<AnalysedEntry>()
+
+        analysedEntries.forEach { e ->
+            when {
+                e.status == FileStatus.SKIP || e.pkg == null -> skipped.add(e)
+                e.status == FileStatus.IDENTICAL             -> { /* not shown */ }
+                else -> byPkg.getOrPut(e.pkg) { mutableListOf() }.add(e)
+            }
+        }
+
+        renderGrouped(byPkg, skipped)
+
+        // ── Summary ───────────────────────────────────────────────────────
+        val newPkgNames   = newPackages.toSortedSet()
+        val effectiveNew  = newCount + (if (knownFileCount > 0) newPkgCount else 0)
 
         status("")
         status("── Summary ─────────────────────────────────────────")
-        status("  NEW:       $newCount  file(s) — will be installed")
+        if (newPkgCount > 0 && knownFileCount > 0) {
+            val pkgWord = if (newPkgNames.size == 1) "package" else "packages"
+            status("  NEW PKG:   ${newPkgNames.size}  new $pkgWord will be created:")
+            newPkgNames.forEach { status("             $it") }
+        } else if (newPkgCount > 0) {
+            val pkgWord = if (newPkgNames.size == 1) "package" else "packages"
+            status("  NEW PKG:   ${newPkgNames.size}  new $pkgWord detected — SKIPPED (wrong module selected?):")
+            newPkgNames.forEach { status("             $it") }
+        }
+        status("  NEW:       $effectiveNew  file(s) — will be installed")
         status("  CHANGED:   $changedCount  file(s) — will be installed")
         status("  IDENTICAL: $identicalCount  file(s) — will be skipped")
-        status("  SKIPPED:   $skipCount  file(s) — package not found or no package")
+        status("  SKIPPED:   $skipCount  file(s) — no package declaration")
 
         analyseComplete = true
-        installAction.isEnabled = (newCount + changedCount) > 0
+        val installable = knownFileCount + (if (knownFileCount > 0) newPkgCount else 0)
+        installAction.isEnabled   = installable > 0
+        showDiffsAction.isEnabled = changedCount > 0
         if (!installAction.isEnabled) status("\nNothing to install.")
     }
 
-    private fun analyseJava(file: File, sourceRoots: List<File>): FileStatus {
-        val content   = file.readText()
-        val pkg       = readPackage(content) ?: run { status("SKIP  (no package):  ${file.name}"); return FileStatus.SKIP }
-        val targetDir = findPackageDir(pkg, sourceRoots) ?: run { status("SKIP  (pkg missing): $pkg  ←  ${file.name}"); return FileStatus.SKIP }
-        val className = cleanFileName(file.name)
-        val target    = File(targetDir, className)
-        return when {
-            !target.exists()               -> { status("NEW       ${file.name}"); FileStatus.NEW }
-            target.readText() == content   -> { FileStatus.IDENTICAL }
-            else                           -> { status("CHANGED   ${file.name}"); FileStatus.CHANGED }
+    /**
+     * Render grouped output:
+     *   Source header (ZIP or .java filename)
+     *     NEW PKG / UPD PKG header per package
+     *       NEW / CHANGED per file indented
+     * IDENTICAL files are not shown.
+     * Files with no package shown at the end.
+     */
+    private fun renderGrouped(
+        byPkg:   LinkedHashMap<String, MutableList<AnalysedEntry>>,
+        skipped: List<AnalysedEntry>
+    ) {
+        // Determine source order and which packages belong to which source
+        val sourceOrder = linkedSetOf<String>()
+        val pkgBySource = linkedMapOf<String, MutableList<String>>()
+        byPkg.keys.forEach { pkg ->
+            val src = byPkg[pkg]!!.first().source
+            sourceOrder.add(src)
+            pkgBySource.getOrPut(src) { mutableListOf() }.add(pkg)
         }
-    }
 
-    private fun analyseZip(file: File, sourceRoots: List<File>): IntArray {
-        var newCount = 0; var changedCount = 0; var identicalCount = 0; var skipCount = 0
-        status("ZIP: ${file.name}")
-        var javaCount = 0
-        ZipFile(file).use { zip ->
-            zip.entries().asSequence().filter { !it.isDirectory && it.name.endsWith(".java") }.forEach { entry ->
-                javaCount++
-                val content   = zip.getInputStream(entry).bufferedReader().readText()
-                val pkg       = readPackage(content)
-                val fileName  = entry.name.substringAfterLast("/")
-                val className = cleanFileName(fileName)
-                if (pkg == null) {
-                    status("  SKIP  (no package):  $fileName")
-                    skipCount++
-                    return@forEach
-                }
-                val targetDir = findPackageDir(pkg, sourceRoots)
-                if (targetDir == null) {
-                    status("  SKIP  (pkg missing): $pkg  ←  $fileName")
-                    skipCount++
-                    return@forEach
-                }
-                val target = File(targetDir, className)
-                when {
-                    !target.exists()                   -> { status("  NEW       $fileName"); newCount++ }
-                    target.readText() == content       -> { identicalCount++ }
-                    else                               -> { status("  CHANGED   $fileName"); changedCount++ }
+        sourceOrder.forEach { src ->
+            status(if (src.endsWith(".zip")) "ZIP: $src" else src)
+            pkgBySource[src]?.forEach { pkg ->
+                val entries = byPkg[pkg] ?: return@forEach
+                val isNew   = newPackages.contains(pkg)
+                status("  ${if (isNew) "NEW PKG" else "UPD PKG"}   $pkg")
+                entries.forEach { e ->
+                    val tag = when (e.status) {
+                        FileStatus.NEW, FileStatus.NEW_PKG -> "NEW    "
+                        FileStatus.CHANGED                 -> "CHANGED"
+                        else                               -> return@forEach
+                    }
+                    status("            $tag   ${e.fileName}")
                 }
             }
         }
-        if (javaCount == 0) status("  (no routeable .java files in zip)")
-        return intArrayOf(newCount, changedCount, identicalCount, skipCount)
+
+        // Flat skipped entries grouped by source
+        skipped.groupBy { it.source }.forEach { (src, entries) ->
+            val isEmptyZip = entries.all { it.fileName.startsWith("(no routeable") }
+            if (!isEmptyZip) status(if (src.endsWith(".zip")) "ZIP: $src" else src)
+            entries.forEach { e ->
+                status(if (e.fileName.startsWith("(no routeable"))
+                    "  $src — ${e.fileName}"
+                else
+                    "  SKIP  (no package):  ${e.fileName}")
+            }
+        }
+    }
+
+    private fun collectJava(file: File, sourceRoots: List<File>) {
+        val content   = file.readText()
+        val pkg       = readPackage(content)
+        val className = cleanFileName(file.name)
+        if (pkg == null) { analysedEntries.add(AnalysedEntry(null, className, FileStatus.SKIP, file.name)); return }
+        val targetDir = findPackageDir(pkg, sourceRoots)
+        if (targetDir == null) {
+            newPackages.add(pkg)
+            analysedEntries.add(AnalysedEntry(pkg, className, FileStatus.NEW_PKG, file.name))
+            return
+        }
+        val target = File(targetDir, className)
+        val status = when {
+            !target.exists()             -> FileStatus.NEW
+            target.readText() == content -> FileStatus.IDENTICAL
+            else                         -> {
+                changedFiles.add(ChangedFile(className, content, target.readText()))
+                FileStatus.CHANGED
+            }
+        }
+        analysedEntries.add(AnalysedEntry(pkg, className, status, file.name))
+    }
+
+    private fun collectZip(file: File, sourceRoots: List<File>) {
+        var javaCount = 0
+        ZipFile(file).use { zip ->
+            zip.entries().asSequence()
+                .filter { !it.isDirectory && it.name.endsWith(".java") }
+                .forEach { entry ->
+                    javaCount++
+                    val content   = zip.getInputStream(entry).bufferedReader().readText()
+                    val pkg       = readPackage(content)
+                    val fileName  = entry.name.substringAfterLast("/")
+                    val className = cleanFileName(fileName)
+                    if (pkg == null) {
+                        analysedEntries.add(AnalysedEntry(null, className, FileStatus.SKIP, file.name))
+                        return@forEach
+                    }
+                    val targetDir = findPackageDir(pkg, sourceRoots)
+                    if (targetDir == null) {
+                        newPackages.add(pkg)
+                        analysedEntries.add(AnalysedEntry(pkg, className, FileStatus.NEW_PKG, file.name))
+                        return@forEach
+                    }
+                    val target = File(targetDir, className)
+                    val status = when {
+                        !target.exists()             -> FileStatus.NEW
+                        target.readText() == content -> FileStatus.IDENTICAL
+                        else                         -> {
+                            changedFiles.add(ChangedFile(className, content, target.readText()))
+                            FileStatus.CHANGED
+                        }
+                    }
+                    analysedEntries.add(AnalysedEntry(pkg, className, status, file.name))
+                }
+        }
+        if (javaCount == 0) analysedEntries.add(AnalysedEntry(null, "(no routeable .java files in zip)", FileStatus.SKIP, file.name))
     }
 
     // ── Install ───────────────────────────────────────────────────────────
@@ -391,13 +619,24 @@ class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(pr
     private fun installJava(file: File, sourceRoots: List<File>): InstallResult {
         val content   = file.readText()
         val pkg       = readPackage(content) ?: run { result("SKIP  (no package):  ${file.name}"); return InstallResult.ERROR }
-        val targetDir = findPackageDir(pkg, sourceRoots) ?: run { result("SKIP  (pkg missing): $pkg  ←  ${file.name}"); return InstallResult.ERROR }
+
+        val existingDir = findPackageDir(pkg, sourceRoots)
+        val targetDir = if (existingDir != null) {
+            existingDir
+        } else {
+            if (knownFileCount == 0) {
+                result("SKIP  (new package, no known files to confirm module): $pkg  ←  ${file.name}")
+                return InstallResult.SKIPPED
+            }
+            findOrCreatePackageDir(pkg, sourceRoots) ?: run {
+                result("ERROR  (could not create package): $pkg  ←  ${file.name}"); return InstallResult.ERROR
+            }
+        }
+
         val className = cleanFileName(file.name)
         val target    = File(targetDir, className)
 
-        if (target.exists() && target.readText() == content) {
-            return InstallResult.SKIPPED
-        }
+        if (target.exists() && target.readText() == content) return InstallResult.SKIPPED
 
         if (target.exists()) {
             val bak = File(targetDir, "$className.bak")
@@ -422,15 +661,24 @@ class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(pr
                 val className = cleanFileName(fileName)
 
                 if (pkg == null) { result("  SKIP  (no package):  $fileName"); errors++; return@forEach }
-                val targetDir = findPackageDir(pkg, sourceRoots) ?: run {
-                    result("  SKIP  (pkg missing): $pkg  ←  $fileName"); errors++; return@forEach
+
+                val existingDir = findPackageDir(pkg, sourceRoots)
+                val targetDir = if (existingDir != null) {
+                    existingDir
+                } else {
+                    if (knownFileCount == 0) {
+                        result("  SKIP  (new package, no known files to confirm module): $pkg  ←  $fileName")
+                        skipped++
+                        return@forEach
+                    }
+                    findOrCreatePackageDir(pkg, sourceRoots) ?: run {
+                        result("  ERROR  (could not create package): $pkg  ←  $fileName"); errors++; return@forEach
+                    }
                 }
+
                 val target = File(targetDir, className)
 
-                if (target.exists() && target.readText() == content) {
-                    skipped++
-                    return@forEach
-                }
+                if (target.exists() && target.readText() == content) { skipped++; return@forEach }
 
                 if (target.exists()) {
                     val bak = File(targetDir, "$className.bak")
@@ -468,6 +716,21 @@ class RouteDownloadedFileDialog(private val project: Project) : DialogWrapper(pr
     private fun findPackageDir(pkg: String, sourceRoots: List<File>): File? {
         val rel = pkg.replace('.', File.separatorChar)
         return sourceRoots.map { File(it, rel) }.firstOrNull { it.exists() && it.isDirectory }
+    }
+
+    /**
+     * Like findPackageDir but creates the directory under the first source root
+     * if it doesn't exist yet. Used during install so new packages are created
+     * automatically rather than being skipped.
+     */
+    private fun findOrCreatePackageDir(pkg: String, sourceRoots: List<File>): File? {
+        val rel = pkg.replace('.', File.separatorChar)
+        val existing = sourceRoots.map { File(it, rel) }.firstOrNull { it.exists() && it.isDirectory }
+        if (existing != null) return existing
+        val root = sourceRoots.firstOrNull() ?: return null
+        val newDir = File(root, rel)
+        newDir.mkdirs()
+        return if (newDir.exists()) newDir else null
     }
 
     private fun cleanFileName(name: String) = name.replace(Regex("\\s*\\(\\d+\\)\\.java$"), ".java")
