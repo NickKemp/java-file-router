@@ -1,0 +1,8 @@
+# Always use LF line endings
+* text=auto eol=lf
+
+# Binary files — no line ending conversion
+*.jar binary
+*.zip binary
+*.png binary
+*.ico binary

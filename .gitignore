@@ -17,3 +17,6 @@ Thumbs.db
 
 # Publishing — token and script contain credentials, never commit
 publish.*
+
+# Backup files created by Plugin Installer
+*.bak

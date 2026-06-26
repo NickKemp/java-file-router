@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 1.6.0
+
+### Added
+
+- Test source roots (src/test/java) are now searched when routing files, in addition to main source roots
+- INSTALLED result lines include a [test] tag when the file was placed under a test source root
+- Analysis output shows UPD PKG SRC or UPD PKG TEST instead of plain UPD PKG, making it clear which source tree the package was found in
+
+### Fixed
+
+- Plugin version label in dialog footer now uses public API (PluginManagerCore.getPluginByClass) instead of internal getPlugin — resolves JetBrains plugin verification warning
+
 ## 1.5.0
 
 ### Changed

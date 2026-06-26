@@ -10,6 +10,7 @@ import com.intellij.openapi.module.ModuleManager
 import com.intellij.openapi.module.ModuleUtilCore
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.roots.ModuleRootManager
+import org.jetbrains.jps.model.java.JavaSourceRootType
 import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.vfs.LocalFileSystem
@@ -228,10 +229,12 @@ class RouteDownloadedFileDialog(
     }
 
     override fun createSouthAdditionalPanel(): JPanel {
-        val version = com.intellij.ide.plugins.PluginManagerCore
-            .getPlugin(com.intellij.openapi.extensions.PluginId.getId(
-                "com.github.nickkemp.javafilerouter"))
-            ?.version ?: "unknown"
+        val version = try {
+            val xml = RouteDownloadedFileDialog::class.java
+                .getResourceAsStream("/META-INF/plugin.xml")
+                ?.bufferedReader()?.readText() ?: ""
+            Regex("<version>(.+?)</version>").find(xml)?.groupValues?.get(1) ?: "unknown"
+        } catch (_: Exception) { "unknown" }
         val label = JBLabel("Java File Download Router  v$version").apply {
             foreground = java.awt.Color.GRAY
             font       = editorFont.deriveFont(java.awt.Font.PLAIN, editorFont.size - 1f)
@@ -557,7 +560,14 @@ class RouteDownloadedFileDialog(
             pkgBySource[src]?.forEach { pkg ->
                 val entries = byPkg[pkg] ?: return@forEach
                 val isNew   = newPackages.contains(pkg)
-                status("  ${if (isNew) "NEW PKG" else "UPD PKG"}   $pkg")
+                val pkgLabel = if (isNew) {
+                    "NEW PKG"
+                } else {
+                    val roots = getSourceRoots() ?: emptyList()
+                    val resolvedDir = findPackageDir(pkg, roots)
+                    if (resolvedDir != null && isTestRoot(resolvedDir)) "UPD PKG TEST" else "UPD PKG SRC"
+                }
+                status("  $pkgLabel   $pkg")
                 entries.forEach { e ->
                     val tag = when (e.status) {
                         FileStatus.NEW, FileStatus.NEW_PKG -> "NEW      "
@@ -711,7 +721,8 @@ class RouteDownloadedFileDialog(
         }
 
         Files.copy(file.toPath(), target.toPath())
-        result("INSTALLED ${file.name}  →  ${targetDir.absolutePath}")
+        val testTag = if (isTestRoot(targetDir)) "  [test]" else ""
+        result("INSTALLED ${file.name}  →  ${targetDir.absolutePath}$testTag")
         return InstallResult.INSTALLED
     }
 
@@ -753,7 +764,8 @@ class RouteDownloadedFileDialog(
                 }
 
                 target.writeText(content)
-                result("  INSTALLED $fileName  →  ${targetDir.absolutePath}")
+                val testTag = if (isTestRoot(targetDir)) "  [test]" else ""
+                result("  INSTALLED $fileName  →  ${targetDir.absolutePath}$testTag")
                 installed++
             }
         }
@@ -765,7 +777,17 @@ class RouteDownloadedFileDialog(
     private fun getSourceRoots(): List<File>? {
         val name   = moduleCombo.selectedItem as? String ?: return null
         val module = ModuleManager.getInstance(project).modules.firstOrNull { it.name == name } ?: return null
-        return ModuleRootManager.getInstance(module).getSourceRoots(false).map { File(it.path) }
+        val mrm = ModuleRootManager.getInstance(module)
+        return (mrm.getSourceRoots(JavaSourceRootType.SOURCE) +
+                mrm.getSourceRoots(JavaSourceRootType.TEST_SOURCE)).map { File(it.path) }
+    }
+
+    private fun isTestRoot(dir: File): Boolean {
+        val name   = moduleCombo.selectedItem as? String ?: return false
+        val module = ModuleManager.getInstance(project).modules.firstOrNull { it.name == name } ?: return false
+        val testRoots = ModuleRootManager.getInstance(module)
+            .getSourceRoots(JavaSourceRootType.TEST_SOURCE).map { File(it.path) }
+        return testRoots.any { dir.canonicalPath.startsWith(it.canonicalPath) }
     }
 
     private fun readPackage(content: String): String? {
@@ -792,7 +814,8 @@ class RouteDownloadedFileDialog(
         val rel = pkg.replace('.', File.separatorChar)
         val existing = sourceRoots.map { File(it, rel) }.firstOrNull { it.exists() && it.isDirectory }
         if (existing != null) return existing
-        val root = sourceRoots.firstOrNull() ?: return null
+        val module2 = ModuleManager.getInstance(project).modules.firstOrNull { it.name == (moduleCombo.selectedItem as? String ?: "") } ?: return null
+        val root = ModuleRootManager.getInstance(module2).getSourceRoots(JavaSourceRootType.SOURCE).map { File(it.path) }.firstOrNull() ?: sourceRoots.firstOrNull() ?: return null
         val newDir = File(root, rel)
         newDir.mkdirs()
         return if (newDir.exists()) newDir else null
